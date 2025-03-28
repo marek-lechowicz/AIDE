@@ -52,33 +52,6 @@ ui <- dashboardPage(title= "AI-Assisted Data Extraction",
     tags$head(
       tags$link(rel = "stylesheet", type = "text/css", href = "www/css/custom.css"),
       tags$style(HTML("
-        .pdf-container {
-          height: 72vh;
-          overflow-y: auto; 
-          overflow-x: hidden; /* Prevent horizontal scrolling */
-          width: 100%;
-          padding: 15px;
-          border: 1px solid #ddd;
-          background-color: #f9f9f9;
-          box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
-          text-align: center;
-          display: flex;
-          flex-direction: column; /* Stack images vertically */
-          align-items: center; /* Center align each image */
-          position: relative;
-        }
-        .pdf-image {
-          max-width: 100%;
-          height: auto;
-          display: block;
-          margin-bottom: 10px; /* Add spacing between pages */
-        }
-        .pdf-container img {
-          width: 100%;
-          height: auto;
-          display: block;
-          margin: 0 auto;
-        }
         .modal-dialog {
               position: fixed !important;
               top: 50% !important;
@@ -139,17 +112,6 @@ ui <- dashboardPage(title= "AI-Assisted Data Extraction",
         right: 0;
         margin: 0 auto;
         width: 100%;
-      }
-      #pdfImage {
-        position: relative !important;  /* This is crucial */
-        overflow-y: auto;
-        height: 72vh;
-        }
-      #pdfImage img {
-        width: 100%;
-        height: auto;
-        display: block;
-        margin: 0 auto;
       }
       .highlight-overlay:hover {
         opacity: 0.7;
@@ -385,7 +347,7 @@ ui <- dashboardPage(title= "AI-Assisted Data Extraction",
                     ),
                     # Model selection
                     selectInput("modelSelect", "Model",
-                                choices = c("gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"),
+                                choices = c("gemini-1.5-flash", "gemini-1.5-pro"),
                                 selected = tryCatch({
                                   fresh_config <- read_config()
                                   fresh_config$api$gemini$model
@@ -670,32 +632,36 @@ ui <- dashboardPage(title= "AI-Assisted Data Extraction",
       tabItem("Analyze",
               fluidRow(
                 # PDF Preview on the left
-                column(width = 6,
+                column(width = 7,
                        box(
-                         width = NULL,
-                         title = "Upload PDF",
-                         status = "primary",
-                         solidHeader = TRUE,
-                         fileInput("pdfFile", "Choose PDF File",
-                                   accept = c("application/pdf")),
-                         div(
-                           actionButton("analyzeBtn", "Analyze PDF",
-                                        class = "btn-primary btn-primary-disabled",  # Start with disabled style
-                                        disabled = TRUE),  # Start disabled
-                         ),
-                         # Add styles to ensure no extra scrollbars
-                         div(class = "pdf-container",
-                             uiOutput("pdfImage"),
-                             div(
-                               uiOutput("fileStatus")
-                             )
-                         )
+                          width = NULL,
+                          title = "Upload PDF",
+                          status = "primary",
+                          solidHeader = TRUE,
+                          div(
+                            style = "display: flex; align-items: center;", # Flex layout for file input and button
+                            fileInput("pdfFile", "Choose PDF File",
+                              accept = c("application/pdf"),
+                              width = "500px"  # Adjust width as needed
+                            ),
+                            actionButton("analyzeBtn", "Analyze PDF",
+                              class = "btn-primary btn-primary-disabled",
+                              disabled = TRUE,
+                              style = "margin-left: 200px; height: 38px;" # Add margin and height
+                            )
+                          ),
+                          # Add styles to ensure no extra scrollbars
+                          div(
+                            id = "pdf-viewer-container",
+                            style = "width: 100%; height: 800px;",
+                            uiOutput("pdfViewer")
+                          )
                        )
                 ),
                 
                 # Chat interface on the right
                 column(
-                  width = 6,
+                  width = 5,
                   fluidRow(
                     box(
                       width = 12,
@@ -750,15 +716,12 @@ server <- function(input, output, session) {
   # Initialize reactive values
   rv <- reactiveValues(
     pdf_text = NULL,
-    pdf_images = NULL,
     results = NULL,
     prompts = NULL,
     current_prompt_index = 1,
     total_pages = 0,
     current_page = 1,
-    temp_files = NULL,
     coding_form = NULL,
-    image_timestamp = NULL,
     sources = list(),
     pages = list(),
     codingForm = NULL,
@@ -767,6 +730,10 @@ server <- function(input, output, session) {
     is_processing = FALSE,
     selected_ollama_model = NULL
   )
+
+  addResourcePath('pdfjs', 'www/pdfjs')
+  options(shiny.maxRequestSize = 30*1024^2)
+
   mistral_key_valid <- reactiveVal(FALSE)
   current_row <- reactiveVal(NULL)
   validationStatus <- reactiveVal("pending") # Can be "pending", "success", or "failed"
@@ -858,17 +825,6 @@ server <- function(input, output, session) {
     })
   })
   
-  output$fileStatus <- renderUI({
-    if (is.null(rv$codingForm)) {
-      div(
-        style = "color: #f00; position: absolute; top: 10px; left: 50%; transform: translateX(-50%);",
-        "Please upload a coding form on the Setup page before proceeding."
-      )
-    } else {
-      div(
-      )
-    }
-  })
   
   # Initialize current_row when the session starts
   observe({
@@ -1653,6 +1609,45 @@ PROMPTS:
             "N/A"
           }
           
+          # Extract quoted text with a maximum of 10 words
+          quoted_matches <- gregexpr('"[^"]+"', source_text)
+          quoted_texts <- regmatches(source_text, quoted_matches)[[1]]
+
+          if (length(quoted_texts) > 0) {
+            # Extract the first quoted text
+            first_quoted_text <- gsub('"', '', quoted_texts[1])
+
+            # Split into words and take the first 10
+            words <- strsplit(first_quoted_text, "\\s+")[[1]]
+            search_term <- paste(head(words, 10), collapse = " ")
+
+            print(paste("Search term: ", search_term))
+
+            runjs(sprintf(
+              "
+              const iframeDocument = document.getElementById('pdfFrame').contentWindow;
+              let searchText = \"%s\";
+              iframeDocument.PDFViewerApplication.eventBus.dispatch('find', {
+                  caseSensitive: false,
+                  findPrevious: undefined,
+                  highlightAll: true,
+                  phraseSearch: true,
+                  query: searchText
+              });
+
+              
+              // Listen for match count updates
+              iframeDocument.PDFViewerApplication.eventBus.on('updatefindmatchescount', (event) => {
+                  let matchCount = event.matchesCount.total;
+                  Shiny.setInputValue('matchCount', matchCount);
+              });
+              ",
+              search_term
+            ))
+          } else {
+            print("Search term empty.")
+          }
+
           # Modified JavaScript to handle "N/A" pages
           scroll_js <- if (!identical(page_num, "N/A")) {
             sprintf("
@@ -1788,6 +1783,8 @@ PROMPTS:
   ## Handle PDF upload ----
   observeEvent(input$pdfFile, {
     req(input$pdfFile)
+
+    file.copy(input$pdfFile$datapath, file.path("www", "to_display.pdf"), overwrite = TRUE)
     
     # Create a reactiveVal for cancel status
     rv$cancel_process <- FALSE
@@ -1824,16 +1821,6 @@ PROMPTS:
     observeEvent(input$cancelPdfProcess, {
       rv$cancel_process <- TRUE
     })
-    
-    # Clear existing images
-    if (!is.null(rv$temp_files)) {
-      runjs("
-          $('.progress-bar').css('width', '10%');
-          $('#pdf-progress-detail').text('Cleaning up previous files...');
-      ")
-      unlink(rv$temp_files)
-      rv$temp_files <- NULL
-    }
     
     tryCatch({
       pdf_file_path <- input$pdfFile$datapath
@@ -1883,30 +1870,6 @@ PROMPTS:
           ", progress_pct, page, total_pages, remaining_text))
       }
       
-      # Convert PDF to images with progress updates
-      image_files <- vector("character", total_pages)
-      for(page in 1:total_pages) {
-        if (rv$cancel_process) {
-          stop("Process cancelled by user")
-        }
-        
-        progress_callback(page)
-        
-        # Convert single page
-        current_file <- file.path(temp_dir, sprintf("page_%d.png", page))
-        pdf_convert(pdf_file_path, 
-                    format = "png", 
-                    pages = page, 
-                    dpi = 150, 
-                    filenames = current_file)
-        
-        image_files[page] <- current_file
-        
-        # Verify file exists
-        if (!file.exists(current_file)) {
-          stop(paste("Failed to create image file for page", page))
-        }
-      }
       
       # Final processing
       runjs("
@@ -1916,24 +1879,13 @@ PROMPTS:
       ")
       
       # Store the files in reactive values
-      rv$temp_files <- image_files
-      rv$pdf_images <- image_files
       rv$pdf_text <- pdf_text(pdf_file_path)
       rv$total_pages <- total_pages
       rv$current_page <- 1
       
-      # Force refresh
-      rv$image_timestamp <- format(Sys.time(), "%Y%m%d%H%M%OS6")
       
       # Update slider
       updateSliderInput(session, "pageSlider", min = 1, max = rv$total_pages, value = 1)
-      
-      # Verify files are accessible
-      lapply(rv$pdf_images, function(f) {
-        if (!file.exists(f)) {
-          warning(paste("File not found:", f))
-        }
-      })
       
       runjs("
           $('.progress-bar').css('width', '100%');
@@ -1946,11 +1898,6 @@ PROMPTS:
     }, error = function(e) {
       print(paste("Error:", e$message))  # Debug print
       if (rv$cancel_process) {
-        # Clean up temporary files if process was cancelled
-        if (!is.null(rv$temp_files)) {
-          unlink(rv$temp_files)
-          rv$temp_files <- NULL
-        }
         showNotification("PDF processing cancelled", type = "warning")
       } else {
         showNotification(paste("Error processing PDF:", e$message), type = "error")
@@ -2090,38 +2037,50 @@ PROMPTS:
     })
   })
   
-  ## Display all PDF pages as images ----
-  output$pdfImage <- renderUI({
-    req(rv$pdf_images)
-    req(rv$image_timestamp)
-    
-    # Debug print
-    print("Rendering PDF images:")
-    print(rv$pdf_images)
-    
-    image_tags <- lapply(rv$pdf_images, function(image_path) {
-      if (!file.exists(image_path)) {
-        warning(paste("Image file not found:", image_path))
-        return(NULL)
-      }
-      
-      # Add timestamp to URL to prevent caching
-      image_url <- paste0("/temp/", basename(image_path), "?t=", rv$image_timestamp)
-      tags$img(src = image_url, 
-               class = "pdf-image", 
-               style = "width: 100%; margin-bottom: 10px;")
-    })
-    
-    # Filter out NULL entries
-    image_tags <- Filter(Negate(is.null), image_tags)
-    
-    if (length(image_tags) == 0) {
-      return(div("No images to display"))
-    }
-    
-    do.call(tagList, image_tags)
+  ## Display PDF----
+  output$pdfViewer <- renderUI({
+    req(input$pdfFile)
+
+    # Embed the PDF.js viewer with the PDF
+    tags$iframe(
+      id = "pdfFrame",
+      src = "pdfjs/web/viewer.html?file=../../to_display.pdf",
+      width = "100%",
+      height = "600px",
+      style = "border: none;"
+    )
   })
-  
+
+  observeEvent(input$searchBtn, {
+    search_term <- input$searchText
+
+    runjs(sprintf(
+      "
+      const iframeDocument = document.getElementById('pdfFrame').contentWindow;
+      let searchText = \"%s\";
+      iframeDocument.PDFViewerApplication.eventBus.dispatch('find', {
+          caseSensitive: false,
+          findPrevious: undefined,
+          highlightAll: true,
+          phraseSearch: true,
+          query: searchText
+      });
+
+      
+      // Listen for match count updates
+      iframeDocument.PDFViewerApplication.eventBus.on('updatefindmatchescount', (event) => {
+          let matchCount = event.matchesCount.total;
+          Shiny.setInputValue('matchCount', matchCount);
+      });
+      ",
+      search_term
+    ))
+  })
+
+  output$matchCountDisplay <- renderText({
+    req(input$matchCount)  # Ensure there's a value
+    paste("Matches found:", input$matchCount)
+  })
   
   #Mistral ----
   
@@ -2838,82 +2797,7 @@ IMPORTANT: For EACH prompt, you must provide:
     return(result)
   }
   
-  ### OpenRouter Save settings ----
-  observeEvent(input$saveSettingsOpenRouter, {
-    # Input validation
-    req(input$apiKeyOpenRouter, input$modelSelectOpenRouter)
-    
-    # Debug prints
-    message("Attempting to save OpenRouter settings...")
-    message("Config file exists: ", file.exists(get_config_path()))
-    message("Config file permissions: ")
-    print(file.info(get_config_path()))
-    
-    tryCatch({
-      # Check if we can read the current config
-      current_config <- read_config()
-      message("Successfully read current config")
-      
-      # Store original values for comparison
-      original_values <- list(
-        api_key = current_config$api$openrouter$api_key,
-        model = current_config$api$openrouter$model
-      )
-      
-      # Validate input values
-      if (is.null(input$apiKeyOpenRouter) || input$apiKeyOpenRouter == "") {
-        showNotification("OpenRouter API key cannot be empty", type = "error")
-        return()
-      }
-      
-      if (is.null(input$modelSelectOpenRouter) || input$modelSelectOpenRouter == "") {
-        showNotification("OpenRouter model must be selected", type = "error")
-        return()
-      }
-      
-      # Update OpenRouter-specific values
-      current_config$api$openrouter$api_key <- input$apiKeyOpenRouter
-      current_config$api$openrouter$model <- input$modelSelectOpenRouter
-      
-      message("About to write config...")
-      # Write the updated config using your function
-      write_config(current_config)
-      message("Config written")
-      
-      # Verify the changes
-      updated_config <- read_config()
-      if (identical(updated_config$api$openrouter$api_key, input$apiKeyOpenRouter) &&
-          identical(updated_config$api$openrouter$model, input$modelSelectOpenRouter)) {
-        
-        showNotification("OpenRouter API Settings saved successfully", type = "message")
-        
-        # Print confirmation of changes
-        message("Settings updated successfully:")
-        message("API Key changed from: ", original_values$api_key, " to: ", updated_config$api$openrouter$api_key)
-        message("Model changed from: ", original_values$model, " to: ", updated_config$api$openrouter$model)
-        
-      } else {
-        showNotification(
-          "OpenRouter settings may not have saved correctly. Please verify.", 
-          type = "warning"
-        )
-        
-        # Print what didn't match
-        message("Verification failed:")
-        message("Expected API key: ", input$apiKeyOpenRouter)
-        message("Actual API key: ", updated_config$api$openrouter$api_key)
-        message("Expected model: ", input$modelSelectOpenRouter)
-        message("Actual model: ", updated_config$api$openrouter$model)
-      }
-      
-    }, error = function(e) {
-      showNotification(
-        paste("Error saving OpenRouter config:", e$message), 
-        type = "error"
-      )
-      message("Error details: ", e$message)
-    })
-  })
+  
 
   
   # Context estimate ---- 
@@ -3079,280 +2963,6 @@ If no direct source is found, explain your reasoning."
     )
   })
   
-  #Ollama----
-  # Function to check Ollama server status  
-  check_ollama_status <- function() {  
-    tryCatch({  
-      # Use system command to check Ollama server  
-      status <- system2("ollama", "list", stdout = TRUE, stderr = TRUE)  
-      
-      # If command succeeds, server is running  
-      if (length(status) > 0) {  
-        return(list(  
-          status = TRUE,   
-          message = "Ollama server is running ✓"  
-        ))  
-      } else {  
-        return(list(  
-          status = FALSE,   
-          message = "Ollama server is not running ✗"  
-        ))  
-      }  
-    }, error = function(e) {  
-      return(list(  
-        status = FALSE,   
-        message = "Error checking Ollama server ✗"  
-      ))  
-    })  
-  }  
-  
-  # Function to get available Ollama models  
-  get_ollama_models <- function() {
-    tryCatch({
-      # Use system command to list Ollama models
-      models <- system2("ollama", "list", stdout = TRUE, stderr = TRUE)
-      
-      if (length(models) > 1) {
-        # Parse model names, skipping the header line
-        parsed_models <- sapply(models[-1], function(model_line) {
-          # Split the line by whitespace and take the first element
-          model_name <- strsplit(trimws(model_line), "\\s+")[[1]][1]
-          return(model_name)
-        })
-        
-        return(parsed_models)
-      } else {
-        return(c("No models found"))
-      }
-    }, error = function(e) {
-      return(c("Error retrieving models"))
-    })
-  }
-  
-  # Reactive Ollama status  
-  ollama_status <- reactive({  
-    check_ollama_status()  
-  })  
-  
-  # Output Ollama server status  
-  output$ollamaStatus <- renderUI({  
-    status <- ollama_status()  
-    if (status$status) {  
-      tags$span(  
-        style = "color: green; font-weight: bold;",   
-        status$message  
-      )  
-    } else {  
-      tags$span(  
-        style = "color: red; font-weight: bold;",   
-        status$message  
-      )  
-    }  
-  })  
-  
-  # Observe model selection changes  
-  observeEvent(input$selectedOllamaModel, {  
-    # Reset activation status when model changes  
-    rv$model_activated <- FALSE    
-    rv$model_test_status <- ""  
-  })
-  
-  # Dynamic Model Selection  
-  output$dynamicModelSelect <- renderUI({
-    req(input$llmMethod == 'Local Models with Ollama')
-    
-    models <- get_ollama_models()
-    
-    selectInput(
-      inputId = "selectedOllamaModel", 
-      label = "Select Ollama Model", 
-      choices = setNames(models, models),  # This ensures the displayed text matches the value
-      selected = models[1]
-    )
-  })
-  
-  # Render the save/test button
-  output$saveButtonOllama <- renderUI({
-    actionButton(
-      "saveOllamaSettings",
-      if(rv$is_processing) "Processing..." else "Activate Model and Send Test Message",
-      icon = if(rv$is_processing) icon("spinner", class = "fa-spin") else icon("save"),
-      style = paste(
-        "color: #fff;",
-        "background-color:", if(rv$is_processing) "#6c757d" else "#337ab7", ";",
-        "border-color:", if(rv$is_processing) "#6c757d" else "#2e6da4", ";"
-      ),
-      disabled = rv$is_processing
-    )
-  })
-  
-  # Save Ollama Settings      
-  observeEvent(input$saveOllamaSettings, {    
-    req(input$selectedOllamaModel)    
-    
-    # Set processing state first
-    rv$is_processing <- TRUE
-    
-    Sys.sleep(0.1)
-    
-    tryCatch({    
-      messages <- list(    
-        list(    
-          role = "user",    
-          content = "Hello, can you understand and respond to this message?"    
-        )    
-      )    
-      
-      response <- chat(    
-        model = input$selectedOllamaModel,    
-        messages = messages,    
-        output = "text"    
-      )    
-      
-      # Update with actual response  
-      if (!is.null(response) && nchar(response) > 0) {    
-        rv$model_test_status <- paste("Response:", response)    
-      } else {    
-        rv$model_test_status <- "No response received from the model"    
-      }    
-      
-    }, error = function(e) {    
-      rv$model_test_status <- paste("Error:", conditionMessage(e))    
-    }, finally = {  
-      # Reset processing state
-      rv$is_processing <- FALSE
-    })    
-  })
-  
-  # Render the status messages    
-  output$modelTestStatus <- renderUI({    
-    req(rv$model_test_status)  
-    
-    div(    
-      style = "padding: 10px;     
-           background-color: #f0f0f0;     
-           border-radius: 5px;     
-           margin-top: 10px;",    
-      div(    
-        tags$strong("Model Response:"),    
-        tags$br(),    
-        tags$span(  
-          style = "color: #333;",   
-          rv$model_test_status  
-        )    
-      )    
-    )    
-  })
-  
-  ## Analyze with Ollama ----
-  analyze_with_ollama <- function(pdf_text, prompts, selected_model, progress_callback = NULL, context_window = contextWindow) {  
-    responses <- list()  
-    
-    if (is.vector(pdf_text) && length(pdf_text) > 1) {
-      pdf_text <- paste(pdf_text, collapse = "\n")
-    }
-    
-    print(paste("Selected model:", selected_model))
-    print(paste("Using context window size:", context_window))
-    
-    for (i in seq_along(prompts)) {  
-      if (!is.null(progress_callback)) {  
-        progress_callback(i, length(prompts))  
-      }  
-      
-      prompt <- sprintf("Analyze this PDF text and answer ALL of the following prompts:  
-  
-PDF TEXT:  
-%s  
-  
-PROMPTS:  
-%s  
-  
-Please respond in exactly this format:  
-ANSWER: [your comprehensive answer]  
-SOURCE: [exact supporting text from PDF, if no direct text, explain reasoning]  
-PAGE: [page number where source appears]",    
-                        pdf_text,    
-                        prompts[i])
-      
-      # Create request body with context_window
-      request_body <- list(
-        model = selected_model,
-        prompt = as.character(prompt),
-        stream = FALSE,
-        options = list(
-          num_ctx = context_window
-        )
-      )
-      
-      print("Request body structure:")
-      print(str(request_body))
-      
-      api_response <- tryCatch({  
-        print("Attempting API call...")
-        
-        response <- httr::POST(
-          url = "http://localhost:11434/api/generate",
-          body = jsonlite::toJSON(request_body, auto_unbox = TRUE),
-          encode = "json",
-          httr::add_headers("Content-Type" = "application/json")
-        )
-        
-        # Debug print the response
-        print("Response status:")
-        print(httr::status_code(response))
-        
-        if (httr::status_code(response) != 200) {
-          error_content <- httr::content(response, "text")
-          print("Error response content:")
-          print(error_content)
-          stop(paste("HTTP", httr::status_code(response), "-", error_content))
-        }
-        
-        result <- jsonlite::fromJSON(httr::content(response, "text", encoding = "UTF-8"))
-        answer_text <- result$response
-        
-        # Parse the response to extract answer, source, and page
-        answer_text <- result$response
-        
-        # Split the response into sections
-        sections <- strsplit(answer_text, "PROMPT:|ANSWER:|SOURCE:|PAGE:", perl = TRUE)[[1]]
-        sections <- trimws(sections)
-        
-        # Remove empty sections
-        sections <- sections[sections != ""]
-        
-        # Extract the answer (should be the first meaningful section after "ANSWER:")
-        answer <- sections[2]  # The answer should be the second section
-        
-        # Extract source and page if they exist
-        source <- if (length(sections) >= 3) sections[3] else "Source not specified"
-        page <- if (length(sections) >= 4) sections[4] else "N/A"
-        
-        list(
-          answer = trimws(answer),
-          source = trimws(source),
-          page = trimws(page)
-        )
-        
-      }, error = function(e) {  
-        print("Error details:")
-        print(e$message)
-        if (!is.null(e$call)) print(paste("Function call:", e$call))
-        
-        list(  
-          answer = paste("Error:", e$message),  
-          source = "Error occurred",  
-          page = "N/A"  
-        )  
-      })  
-      
-      responses[[i]] <- api_response  
-      Sys.sleep(1)
-    }  
-    
-    return(responses)
-  }
   
   
   
